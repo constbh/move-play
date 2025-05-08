@@ -1,13 +1,15 @@
 module cbh_token::cbh_token {
     use std::option;
     use std::vector;
-    use sui::object::{Self, UID};
+    use sui::object::{Self, UID, ID};
     use sui::coin::{Self, Coin};
     use sui::transfer;
     use sui::tx_context::{Self, TxContext};
     use sui::url::Url;
     use sui::hash::blake2b256;
     use std::bcs;
+    use sui::event;
+    use sui::dynamic_field;
 
     /// 代币名称
     const TOKEN_NAME: vector<u8> = b"CBH";
@@ -58,6 +60,33 @@ module cbh_token::cbh_token {
         receivers: vector<address>
     }
 
+    /// 分片ID事件
+    struct ShardIdEvent has copy, drop {
+        address: address,
+        shard_id: u64,
+        shard_object_id: ID
+    }
+
+    /// 接收者分片信息
+    struct ReceiverShardInfo has copy, drop {
+        receiver: address,
+        shard_id: u64,
+        shard_object_id: ID
+    }
+
+    /// 空投创建事件
+    struct AirdropCreatedEvent has copy, drop {
+        airdrop_id: ID,
+        creator: address,
+        total_amount: u64,
+        amount_per_user: u64,
+        start_time: u64,
+        end_time: u64,
+        total_shards: u64,
+        whitelist_root: vector<u8>,
+        receiver_shard_infos: vector<ReceiverShardInfo>
+    }
+
     /// 模块初始化函数
     fun init(witness: CBH_TOKEN, ctx: &mut TxContext) {
         let (treasury_cap, metadata) = coin::create_currency(
@@ -83,7 +112,7 @@ module cbh_token::cbh_token {
         whitelist_root: vector<u8>,
         receivers: vector<address>,
         ctx: &mut TxContext
-    ) {
+    ): ID {
         let creator = tx_context::sender(ctx);
         let total_shards = DEFAULT_SHARD_NUM;
         let amount_per_shard = total_amount / total_shards;
@@ -101,10 +130,14 @@ module cbh_token::cbh_token {
             is_active: true,
             receivers
         };
-        transfer::share_object(airdrop);
+        let airdrop_id = object::id(&airdrop);
 
-        // 创建分片
+        // 创建分片并记录分片信息
         let i = 0;
+        let receiver_shard_infos = vector::empty<ReceiverShardInfo>();
+        let shard_object_ids = vector::empty<ID>();
+        
+        // 先创建所有分片
         while (i < total_shards) {
             let shard = AirdropShard {
                 id: object::new(ctx),
@@ -113,9 +146,44 @@ module cbh_token::cbh_token {
                 amount_per_user,
                 remaining_tokens: coin::mint(treasury_cap, amount_per_shard, ctx)
             };
+            let shard_id = object::id(&shard);
+            vector::push_back(&mut shard_object_ids, shard_id);
             transfer::share_object(shard);
             i = i + 1;
-        }
+        };
+
+        // 计算每个接收者的分片信息
+        let j = 0;
+        let receivers_len = vector::length(&receivers);
+        while (j < receivers_len) {
+            let receiver = *vector::borrow(&receivers, j);
+            let shard_id = calculate_shard_id(receiver, total_shards);
+            let shard_object_id = *vector::borrow(&shard_object_ids, shard_id);
+            
+            let receiver_info = ReceiverShardInfo {
+                receiver,
+                shard_id,
+                shard_object_id
+            };
+            vector::push_back(&mut receiver_shard_infos, receiver_info);
+            j = j + 1;
+        };
+
+        // 发出创建事件
+        event::emit(AirdropCreatedEvent {
+            airdrop_id,
+            creator,
+            total_amount,
+            amount_per_user,
+            start_time,
+            end_time,
+            total_shards,
+            whitelist_root,
+            receiver_shard_infos
+        });
+
+        transfer::share_object(airdrop);
+        airdrop_id
     }
 
     /// 计算用户应该使用的分片ID
@@ -224,5 +292,21 @@ module cbh_token::cbh_token {
             transfer::public_transfer(coin, *recipient);
             i = i + 1;
         };
+    }
+
+    /// 获取地址对应的分片ID
+    public fun get_shard_id_for_address(airdrop: &Airdrop, addr: address): u64 {
+        calculate_shard_id(addr, airdrop.total_shards)
+    }
+
+    /// 外部调用获取分片ID的入口函数
+    public entry fun get_shard_id(airdrop: &Airdrop, shard: &AirdropShard, addr: address, ctx: &mut TxContext) {
+        let shard_id = get_shard_id_for_address(airdrop, addr);
+        assert!(shard_id == shard.shard_id, EINVALID_SHARD_ID);
+        event::emit(ShardIdEvent {
+            address: addr,
+            shard_id,
+            shard_object_id: object::id(shard)
+        });
     }
 } 

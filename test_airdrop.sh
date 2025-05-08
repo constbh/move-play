@@ -1,104 +1,108 @@
 #!/bin/bash
 
-# 设置环境变量
-export SUI_RPC_URL="https://fullnode.testnet.sui.io:443"
+# 生成随机地址的函数
+generate_random_addresses() {
+    local count=$1
+    local addresses=()
+    
+    for ((i=0; i<count; i++)); do
+        # 生成32字节的随机十六进制字符串
+        local random_bytes=$(openssl rand -hex 32)
+        addresses+=("0x$random_bytes")
+    done
+    
+    echo "${addresses[@]}"
+}
 
-# 生成10个随机地址
-echo "生成10个随机地址..."
-ADDRESSES=()
-for i in {1..10}; do
-    ADDRESSES+=("0x$(openssl rand -hex 32)")
-done
+# 计算分片ID的函数
+calculate_shard_id() {
+    local address=$1
+    local total_shards=$2
+    
+    # 使用Python计算blake2b哈希
+    local shard_id=$(python3 -c "
+import hashlib
+import sys
 
-# 将地址列表转换为JSON数组格式
-RECEIVERS_LIST="["
-for addr in "${ADDRESSES[@]}"; do
-    RECEIVERS_LIST+="\"$addr\","
-done
-RECEIVERS_LIST=${RECEIVERS_LIST%,}"]"
+address = sys.argv[1]
+total_shards = int(sys.argv[2])
 
-echo "接收者列表: $RECEIVERS_LIST"
+# 移除0x前缀
+address = address[2:]
 
-# 获取合约ID和TreasuryCap ID
-PACKAGE_ID="0x9fed724f1aa624cb7cbad335cf4c0e914fceb2d89cfff17fcd0500371ef5d98a"
-TREASURY_CAP="0x4d2875cdd64859d42d8b0a9676c04ecb2426cd69aeee0af14443933953925889"
+# 计算blake2b哈希
+hash_obj = hashlib.blake2b(digest_size=8)
+hash_obj.update(bytes.fromhex(address))
+first_hash = hash_obj.hexdigest()
+
+# 再次计算哈希
+hash_obj = hashlib.blake2b(digest_size=8)
+hash_obj.update(bytes.fromhex(first_hash))
+final_hash = hash_obj.hexdigest()
+
+# 转换为十进制并对分片总数取模
+shard_id = int(final_hash, 16) % total_shards
+print(shard_id)
+" "$address" "$total_shards")
+    
+    echo "$shard_id"
+}
+
+# 生成20个随机地址
+echo "生成20个随机地址..."
+addresses=($(generate_random_addresses 20))
+echo "接收者列表: ${addresses[*]}"
 
 # 创建空投
 echo "创建空投..."
-TRANSACTION_OUTPUT=$(sui client call \
-    --package 0x9fed724f1aa624cb7cbad335cf4c0e914fceb2d89cfff17fcd0500371ef5d98a \
-    --module cbh_token \
+airdrop_result=$(sui client call --package 0x8a0c838415206b7a47f19d19db0dde65d3e1b169179210f6d2ebe71d21e58b21 \
+    --module airdrop \
     --function create_airdrop \
-    --args $TREASURY_CAP 1000000000 1000000 $(date +%s) $(($(date +%s) + 3600)) "" "$RECEIVERS_LIST" \
-    --gas-budget 100000000 \
-    --json 2>&1)
+    --args "${addresses[@]}" \
+    --gas-budget 100000000)
 
+# 提取空投对象ID
+airdrop_id=$(echo "$airdrop_result" | grep -oP 'Created Objects:.*?ID: \K[0-9a-fx]+')
+echo "空投对象ID: $airdrop_id"
+
+# 等待交易确认
 echo "等待交易确认..."
+sleep 5
 
-# 从输出中提取JSON部分
-JSON_OUTPUT=$(echo "$TRANSACTION_OUTPUT" | sed -n '/^{/,/^}/p')
+# 获取分片对象
+shard_objects=($(sui client call --package 0x8a0c838415206b7a47f19d19db0dde65d3e1b169179210f6d2ebe71d21e58b21 \
+    --module airdrop \
+    --function get_shard_objects \
+    --args "$airdrop_id" \
+    --gas-budget 100000000 | grep -oP 'ID: \K[0-9a-fx]+'))
 
-# 检查是否成功获取JSON输出
-if ! jq -e . >/dev/null 2>&1 <<<"$JSON_OUTPUT"; then
-    echo "错误：无法解析交易输出为JSON格式"
-    echo "交易输出: $TRANSACTION_OUTPUT"
-    exit 1
-fi
+echo "创建了 ${#shard_objects[@]} 个分片对象"
 
-# 使用jq提取空投对象ID
-AIRDROP_ID=$(echo "$JSON_OUTPUT" | jq -r '.objectChanges[] | select(.objectType | endswith("::Airdrop")) | .objectId')
-if [ -z "$AIRDROP_ID" ]; then
-    echo "错误：无法获取空投对象ID"
-    echo "交易输出: $JSON_OUTPUT"
-    exit 1
-fi
-
-echo "空投对象ID: $AIRDROP_ID"
-
-# 获取分片对象数量和ID列表
-SHARD_IDS=($(echo "$JSON_OUTPUT" | jq -r '.objectChanges[] | select(.objectType | endswith("::AirdropShard")) | .objectId'))
-SHARD_COUNT=${#SHARD_IDS[@]}
-
-if [ "$SHARD_COUNT" -eq 0 ]; then
-    echo "错误：未创建任何分片对象"
-    exit 1
-fi
-
-echo "创建了 $SHARD_COUNT 个分片对象"
-
-# 为每个地址领取空投
-i=0
-for addr in "${ADDRESSES[@]}"; do
-    if [ $i -ge $SHARD_COUNT ]; then
-        echo "错误：分片对象数量不足"
-        exit 1
-    fi
+# 为每个地址计算分片ID并领取
+for address in "${addresses[@]}"; do
+    # 计算分片ID
+    shard_id=$(calculate_shard_id "$address" ${#shard_objects[@]})
+    shard_object=${shard_objects[$shard_id]}
     
-    SHARD_ID=${SHARD_IDS[$i]}
-    echo "用户地址 $addr 使用分片ID $SHARD_ID 领取空投..."
+    echo "用户地址 $address 计算得到的分片ID: $shard_id, 使用分片对象: $shard_object"
     
-    CLAIM_OUTPUT=$(sui client call \
-        --package 0x9fed724f1aa624cb7cbad335cf4c0e914fceb2d89cfff17fcd0500371ef5d98a \
-        --module cbh_token \
-        --function claim_airdrop \
-        --args $AIRDROP_ID $SHARD_ID $addr \
-        --gas-budget 10000000 \
-        --json 2>&1)
-    
-    # 从输出中提取JSON部分
-    CLAIM_JSON=$(echo "$CLAIM_OUTPUT" | sed -n '/^{/,/^}/p')
-    
-    # 检查领取结果
-    if ! jq -e . >/dev/null 2>&1 <<<"$CLAIM_JSON"; then
-        echo "警告：领取结果不是有效的JSON格式"
-        echo "领取结果: $CLAIM_OUTPUT"
-    else
-        DIGEST=$(echo "$CLAIM_JSON" | jq -r '.digest')
-        STATUS=$(echo "$CLAIM_JSON" | jq -r '.effects.status.status')
-        echo "领取结果 - 交易摘要: $DIGEST, 状态: $STATUS"
-    fi
-    
-    ((i++))
+    # 异步领取
+    (
+        claim_result=$(sui client call --package 0x8a0c838415206b7a47f19d19db0dde65d3e1b169179210f6d2ebe71d21e58b21 \
+            --module airdrop \
+            --function claim \
+            --args "$airdrop_id" "$shard_object" "$address" \
+            --gas-budget 100000000)
+        
+        # 提取交易摘要和状态
+        digest=$(echo "$claim_result" | grep -oP 'Transaction Digest: \K[0-9a-f]+')
+        status=$(echo "$claim_result" | grep -oP 'Status: \K[A-Z]+')
+        
+        echo "地址 $address 领取结果 - 交易摘要: $digest, 状态: $status"
+    ) &
 done
+
+# 等待所有后台任务完成
+wait
 
 echo "空投测试完成" 
